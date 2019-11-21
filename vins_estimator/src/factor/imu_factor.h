@@ -9,6 +9,7 @@
 
 #include <ceres/ceres.h>
 
+// IMU的因子继承自SizeCostFunction, SizeCostFunction的模板参数会指定误差的维度和优化变量的维度
 class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
 {
   public:
@@ -19,6 +20,7 @@ class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
     virtual bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const
     {
 
+        // 为啥不用Map了
         Eigen::Vector3d Pi(parameters[0][0], parameters[0][1], parameters[0][2]);
         Eigen::Quaterniond Qi(parameters[0][6], parameters[0][3], parameters[0][4], parameters[0][5]);
 
@@ -60,8 +62,10 @@ class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
         Eigen::Map<Eigen::Matrix<double, 15, 1>> residual(residuals);
         residual = pre_integration->evaluate(Pi, Qi, Vi, Bai, Bgi,
                                             Pj, Qj, Vj, Baj, Bgj);
-
+        
+        // notice Ｌ不需要transpose()
         Eigen::Matrix<double, 15, 15> sqrt_info = Eigen::LLT<Eigen::Matrix<double, 15, 15>>(pre_integration->covariance.inverse()).matrixL().transpose();
+    
         //sqrt_info.setIdentity();
         residual = sqrt_info * residual;
 

@@ -28,11 +28,14 @@ void FeatureManager::clearState()
 int FeatureManager::getFeatureCount()
 {
     int cnt = 0;
+    // 遍历每一个特征点
     for (auto &it : feature)
     {
 
+　　　　　// 查看每一个特征点被观测的次数
         it.used_num = it.feature_per_frame.size();
-
+        // 如果一个特征点被观测的次数大于２次，同时其被观测的启始帧的id小于recent frame I2, 
+        // 那么它很有可能被成功３角化，进行视觉约束
         if (it.used_num >= 2 && it.start_frame < WINDOW_SIZE - 2)
         {
             cnt++;
@@ -44,55 +47,63 @@ int FeatureManager::getFeatureCount()
 
 bool FeatureManager::addFeatureCheckParallax(int frame_count, const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, double td)
 {
-    ROS_DEBUG("input feature: %d", (int)image.size());
-    ROS_DEBUG("num of feature: %d", getFeatureCount());
+
+    ROS_DEBUG("input feature: %d", (int)image.size()); //打印当前帧的特征点的数目
+    ROS_DEBUG("num of feature: %d", getFeatureCount());　// 统计当前滑窗中可以使用的特征点的数目
     double parallax_sum = 0;
     int parallax_num = 0;
     last_track_num = 0;
+　　
+　　 // 统计当前帧的中的特征点　
     for (auto &id_pts : image)
     {
-        FeaturePerFrame f_per_fra(id_pts.second[0].second, td);
+        // id_pts.second[0] 表示cam0的观测，　
 
+        FeaturePerFrame f_per_fra(id_pts.second[0].second, td);
+　　　　　// 获取feature id 号
         int feature_id = id_pts.first;
+        // 判断该特征点是否以前观测到过
         auto it = find_if(feature.begin(), feature.end(), [feature_id](const FeaturePerId &it)
                           {
             return it.feature_id == feature_id;
                           });
-
+　　　　　// 如果是新的特征，则创建一个新的特征点
         if (it == feature.end())
         {
-            feature.push_back(FeaturePerId(feature_id, frame_count));
-            feature.back().feature_per_frame.push_back(f_per_fra);
+            feature.push_back(FeaturePerId(feature_id, frame_count));　//构造一个新的特征点
+            feature.back().feature_per_frame.push_back(f_per_fra);　　 // 将当前帧的观测压人到观测中 
         }
-        else if (it->feature_id == feature_id)
+        else if (it->feature_id == feature_id)//　如果不是一个新的特征点，则将特征点压入到对应的观测中
         {
             it->feature_per_frame.push_back(f_per_fra);
-            last_track_num++;
+            last_track_num++;  //统计当前帧被成功观测的次数
         }
     }
 
-    if (frame_count < 2 || last_track_num < 20)
+    if (frame_count < 2 || last_track_num < 20) // 如果当前滑窗中帧的个数少于２帧，或者特征点的数目少于20帧，必须生成一个关键帧
         return true;
 
+    //　遍历每一个特征点，其中特征点的要求是，启始帧id必须小于I2,同时其end frame　必须在Ｉ１,Ｉ0观测到
     for (auto &it_per_id : feature)
     {
         if (it_per_id.start_frame <= frame_count - 2 &&
             it_per_id.start_frame + int(it_per_id.feature_per_frame.size()) - 1 >= frame_count - 1)
         {
+            // 计算特征点在Ｉ0, I1中的视差,
             parallax_sum += compensatedParallax2(it_per_id, frame_count);
             parallax_num++;
         }
     }
-
+　　 //　如果没有在I0, I１帧观测到，返回true
     if (parallax_num == 0)
     {
         return true;
     }
     else
     {
-        ROS_DEBUG("parallax_sum: %lf, parallax_num: %d", parallax_sum, parallax_num);
-        ROS_DEBUG("current parallax: %lf", parallax_sum / parallax_num * FOCAL_LENGTH);
-        return parallax_sum / parallax_num >= MIN_PARALLAX;
+        ROS_DEBUG("parallax_sum: %lf, parallax_num: %d", parallax_sum, parallax_num); // 打印视差合法的数目
+        ROS_DEBUG("current parallax: %lf", parallax_sum / parallax_num * FOCAL_LENGTH);　// 打印平均视差
+        return parallax_sum / parallax_num >= MIN_PARALLAX;　// 如果视差大于一定阈值,返回true
     }
 }
 
@@ -187,7 +198,7 @@ VectorXd FeatureManager::getDepthVector()
     int feature_index = -1;
     for (auto &it_per_id : feature)
     {
-        it_per_id.used_num = it_per_id.feature_per_frame.size();
+        it_per_id.used_num = it_per_id.feature_per_frame.size();// 特征点被观测的次数
         if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
             continue;
 #if 1
@@ -199,19 +210,28 @@ VectorXd FeatureManager::getDepthVector()
     return dep_vec;
 }
 
+/*
+三角化滑窗中的每一个未三角化的特征点,每个三角化的特征点的host frame都是特征点被观测到的第一帧,
+这个和basalt 不太一样
+*/
 void FeatureManager::triangulate(Vector3d Ps[], Vector3d tic[], Matrix3d ric[])
 {
+    //step1: 遍历每一个特征点
     for (auto &it_per_id : feature)
     {
-        it_per_id.used_num = it_per_id.feature_per_frame.size();
+
+        it_per_id.used_num = it_per_id.feature_per_frame.size(); // 特征点被观测到的次数
+        // 如果一个特征点的被观测的次数少于2次或者起始帧大于等于I2,不再进行三角化
         if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
             continue;
-
+        // 如果被估计的深度大于0,不需要在进行三角化了
         if (it_per_id.estimated_depth > 0)
             continue;
+        // 获得特征点被观测的起始帧的位置    
         int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
 
         ROS_ASSERT(NUM_OF_CAM == 1);
+        // 每个特征点的观测值贡献两个三角化的误差
         Eigen::MatrixXd svd_A(2 * it_per_id.feature_per_frame.size(), 4);
         int svd_idx = 0;
 
@@ -225,10 +245,12 @@ void FeatureManager::triangulate(Vector3d Ps[], Vector3d tic[], Matrix3d ric[])
         {
             imu_j++;
 
+            // 将每一个特征点的最后一个视觉测量对应的参考帧的位姿变换到start frame
             Eigen::Vector3d t1 = Ps[imu_j] + Rs[imu_j] * tic[0];
             Eigen::Matrix3d R1 = Rs[imu_j] * ric[0];
             Eigen::Vector3d t = R0.transpose() * (t1 - t0);
             Eigen::Matrix3d R = R0.transpose() * R1;
+
             Eigen::Matrix<double, 3, 4> P;
             P.leftCols<3>() = R.transpose();
             P.rightCols<1>() = -R.transpose() * t;
@@ -236,7 +258,7 @@ void FeatureManager::triangulate(Vector3d Ps[], Vector3d tic[], Matrix3d ric[])
             svd_A.row(svd_idx++) = f[0] * P.row(2) - f[2] * P.row(0);
             svd_A.row(svd_idx++) = f[1] * P.row(2) - f[2] * P.row(1);
 
-            if (imu_i == imu_j)
+            if (imu_i == imu_j) // 这句话没什么用
                 continue;
         }
         ROS_ASSERT(svd_idx == svd_A.rows());
@@ -278,11 +300,14 @@ void FeatureManager::removeBackShiftDepth(Eigen::Matrix3d marg_R, Eigen::Vector3
          it != feature.end(); it = it_next)
     {
         it_next++;
-
-        if (it->start_frame != 0)
-            it->start_frame--;
+        // condition１: 如果特征点的主导帧不属于第0帧,只更新特征点的启始帧的id
+        if (it->start_frame != 0)//更新特征点的启始帧的id
+            it->start_frame--;　//condition2: 特征点的主导帧(启使帧))不是第零帧情况判断结束
         else
-        {
+        {　　//condition2: 特征点的启始帧是第０帧
+        　　
+        　　 //!!!Notice 按理说应该直接丢掉第零帧主导的所有视觉观测，但是VINS-Mono好像还留着,有待考虑
+            //将KF0主导的特征点的start frame 转移到KF1, 同时需要更新特征点的逆深度
             Eigen::Vector3d uv_i = it->feature_per_frame[0].point;  
             it->feature_per_frame.erase(it->feature_per_frame.begin());
             if (it->feature_per_frame.size() < 2)
@@ -318,14 +343,17 @@ void FeatureManager::removeBack()
          it != feature.end(); it = it_next)
     {
         it_next++;
-
+　　　　　// condition1: 特征点的的启始帧不是第一帧，则将他们启始帧的id号--
         if (it->start_frame != 0)
             it->start_frame--;
+            // condition１: 特征点在启始帧不是第一帧情况处理完毕
         else
         {
+            // condition2: 特征点是启始是第0帧，需要剔除在原始第0帧的观测，但是启始帧的id号不需要修改
             it->feature_per_frame.erase(it->feature_per_frame.begin());
             if (it->feature_per_frame.size() == 0)
                 feature.erase(it);
+            // condition2: 特征点是启始是第0帧的情况处理完毕
         }
     }
 }
@@ -335,13 +363,15 @@ void FeatureManager::removeFront(int frame_count)
     for (auto it = feature.begin(), it_next = feature.begin(); it != feature.end(); it = it_next)
     {
         it_next++;
-
+　　　　　// condition１: 特征点的启始帧是最新帧
+        // 因为是将次新帧删除，最新帧将会变为次新帧，所以最新帧的host主导的3d点的启始帧的id号将会--
         if (it->start_frame == frame_count)
         {
             it->start_frame--;
-        }
+        } //condition１ 特征点的启始帧是最新帧的情况处理完毕
         else
         {
+            // condition2: 剔除特征点在次新帧的观测
             int j = WINDOW_SIZE - 1 - it->start_frame;
             if (it->endFrame() < frame_count - 1)
                 continue;

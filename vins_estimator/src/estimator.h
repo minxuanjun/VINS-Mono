@@ -27,7 +27,9 @@ class Estimator
 {
   public:
     Estimator();
-
+    
+    // 设置相机和ＩＭＵ的外参，视觉测量的标准差, time_offset
+    // notice time_offset is very important
     void setParameter();
 
     // interface

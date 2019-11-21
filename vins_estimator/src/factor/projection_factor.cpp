@@ -107,6 +107,7 @@ bool ProjectionFactor::Evaluate(double const *const *parameters, double *residua
         }
         if (jacobians[3])
         {
+            
             Eigen::Map<Eigen::Vector2d> jacobian_feature(jacobians[3]);
 #if 1
             jacobian_feature = reduce * ric.transpose() * Rj.transpose() * Ri * ric * pts_i * -1.0 / (inv_dep_i * inv_dep_i);

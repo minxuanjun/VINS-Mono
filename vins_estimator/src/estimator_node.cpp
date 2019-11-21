@@ -16,7 +16,7 @@
 Estimator estimator;
 
 std::condition_variable con;
-double current_time = -1;
+double current_time = -1; //后端滑窗优化IMU预积分上一时刻的位置
 queue<sensor_msgs::ImuConstPtr> imu_buf;
 queue<sensor_msgs::PointCloudConstPtr> feature_buf;
 queue<sensor_msgs::PointCloudConstPtr> relo_buf;
@@ -60,23 +60,27 @@ void predict(const sensor_msgs::ImuConstPtr &imu_msg)
     double ry = imu_msg->angular_velocity.y;
     double rz = imu_msg->angular_velocity.z;
     Eigen::Vector3d angular_velocity{rx, ry, rz};
-
+    //　ａ　＝　R_g_imu *(am - ba) + g
     Eigen::Vector3d un_acc_0 = tmp_Q * (acc_0 - tmp_Ba) - estimator.g;
-
+    // w = wm - bg
+    // notice　这里角度的增量使用的是中值积分
     Eigen::Vector3d un_gyr = 0.5 * (gyr_0 + angular_velocity) - tmp_Bg;
+    // R_j_i+1 = R_j_i * R_i_i+11
     tmp_Q = tmp_Q * Utility::deltaQ(un_gyr * dt);
-
+    // 加速度进行中值积分
     Eigen::Vector3d un_acc_1 = tmp_Q * (linear_acceleration - tmp_Ba) - estimator.g;
-
+    
     Eigen::Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
 
     tmp_P = tmp_P + dt * tmp_V + 0.5 * dt * dt * un_acc;
     tmp_V = tmp_V + dt * un_acc;
 
+　　 // 存储上一时刻的加速度值, 
     acc_0 = linear_acceleration;
     gyr_0 = angular_velocity;
 }
 
+// 利用后端优化最新的ＩＭＵ状态的估计值来进行ＩＭＵ状态的最新预测
 void update()
 {
     TicToc t_predict;
@@ -95,6 +99,9 @@ void update()
 
 }
 
+/*
+\brief 寻找时间戳对齐的视觉测量和ＩＭＵ测量
+*/
 std::vector<std::pair<std::vector<sensor_msgs::ImuConstPtr>, sensor_msgs::PointCloudConstPtr>>
 getMeasurements()
 {
@@ -102,25 +109,27 @@ getMeasurements()
 
     while (true)
     {
+        // condition1: 没有可用的ＩＭＵ数据或者视觉测量数据
         if (imu_buf.empty() || feature_buf.empty())
             return measurements;
-
+        // condition2: IMU的数据时间戳小于视觉的时间戳，需要等待更多的ＩＭＵ数据
         if (!(imu_buf.back()->header.stamp.toSec() > feature_buf.front()->header.stamp.toSec() + estimator.td))
         {
             //ROS_WARN("wait for imu, only should happen at the beginning");
             sum_of_wait++;
             return measurements;
         }
-
+        // condition3: IMU数据的时间戳超前与视觉的时间戳，视觉测量需要剔除
         if (!(imu_buf.front()->header.stamp.toSec() < feature_buf.front()->header.stamp.toSec() + estimator.td))
         {
             ROS_WARN("throw img, only should happen at the beginning");
             feature_buf.pop();
             continue;
         }
+        //　取出可用的视觉测量
         sensor_msgs::PointCloudConstPtr img_msg = feature_buf.front();
         feature_buf.pop();
-
+        // 获取对应区间的ＩＭＵ数据
         std::vector<sensor_msgs::ImuConstPtr> IMUs;
         while (imu_buf.front()->header.stamp.toSec() < img_msg->header.stamp.toSec() + estimator.td)
         {
@@ -130,11 +139,17 @@ getMeasurements()
         IMUs.emplace_back(imu_buf.front());
         if (IMUs.empty())
             ROS_WARN("no imu between two image");
+        // 将IMU数据和图像数据组合成一个pair
         measurements.emplace_back(IMUs, img_msg);
     }
     return measurements;
 }
-
+/*
+*\brief IMU　的回调函数,完成以下３个任务
+1. 将IMU数据压入缓冲队列，
+2. 更新IMU时间戳的信息,
+3. 并利用IMU的数据预测ＩＭＵ的最新状态
+*/
 void imu_callback(const sensor_msgs::ImuConstPtr &imu_msg)
 {
     if (imu_msg->header.stamp.toSec() <= last_imu_t)
@@ -161,7 +176,9 @@ void imu_callback(const sensor_msgs::ImuConstPtr &imu_msg)
     }
 }
 
-
+/*
+接受front-end 的特征追踪
+*/
 void feature_callback(const sensor_msgs::PointCloudConstPtr &feature_msg)
 {
     if (!init_feature)
@@ -170,12 +187,18 @@ void feature_callback(const sensor_msgs::PointCloudConstPtr &feature_msg)
         init_feature = 1;
         return;
     }
+    // notice　注意上锁，但是感觉美誉必要,ROS的消息好像并不是多线程触发的，同一时刻只有一个
+    // 回调函数可以用
     m_buf.lock();
     feature_buf.push(feature_msg);
     m_buf.unlock();
     con.notify_one();
 }
 
+/*
+ * \brief 系统重启的回调函数, 清除视觉测量个IMU的缓冲队列
+ * ，　后端优化重启
+ */
 void restart_callback(const std_msgs::BoolConstPtr &restart_msg)
 {
     if (restart_msg->data == true)
@@ -209,15 +232,19 @@ void relocalization_callback(const sensor_msgs::PointCloudConstPtr &points_msg)
 void process()
 {
     while (true)
-    {
+
+        // step1: 获得一帧视觉测量和对应的IMＵ数据包
         std::vector<std::pair<std::vector<sensor_msgs::ImuConstPtr>, sensor_msgs::PointCloudConstPtr>> measurements;
+        //notice 要对视觉测量和IMU缓冲队列进行写操作，注意上锁
         std::unique_lock<std::mutex> lk(m_buf);
         con.wait(lk, [&]
                  {
             return (measurements = getMeasurements()).size() != 0;
                  });
-        lk.unlock();
-        m_estimator.lock();
+        lk.unlock();　// 解锁，可以让新的视觉测量和IMU输入压入缓冲队列
+        m_estimator.lock(); //
+        // step2: 后端的滑窗优化
+        // step2.1 IMU的预积分
         for (auto &measurement : measurements)
         {
             auto img_msg = measurement.second;
@@ -225,7 +252,8 @@ void process()
             for (auto &imu_msg : measurement.first)
             {
                 double t = imu_msg->header.stamp.toSec();
-                double img_t = img_msg->header.stamp.toSec() + estimator.td;
+                // notice: image 的时间戳要加time offset
+                double img_t = img_msg->header.stamp.toSec() + estimator.td; 
                 if (t <= img_t)
                 { 
                     if (current_time < 0)
@@ -245,6 +273,7 @@ void process()
                 }
                 else
                 {
+                    // 线性插值最后一帧IMU数据
                     double dt_1 = img_t - current_time;
                     double dt_2 = t - img_t;
                     current_time = img_t;
@@ -263,7 +292,7 @@ void process()
                     //printf("dimu: dt:%f a: %f %f %f w: %f %f %f\n",dt_1, dx, dy, dz, rx, ry, rz);
                 }
             }
-            // set relocalization frame
+            //step2.2 set relocalization frame
             sensor_msgs::PointCloudConstPtr relo_msg = NULL;
             while (!relo_buf.empty())
             {
@@ -291,12 +320,13 @@ void process()
             }
 
             ROS_DEBUG("processing vision data with stamp %f \n", img_msg->header.stamp.toSec());
-
+            // step2.3: 构造视觉残差
             TicToc t_s;
             map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> image;
             for (unsigned int i = 0; i < img_msg->points.size(); i++)
             {
                 int v = img_msg->channels[0].values[i] + 0.5;
+                // 获取相机的id号
                 int feature_id = v / NUM_OF_CAM;
                 int camera_id = v % NUM_OF_CAM;
                 double x = img_msg->points[i].x;
@@ -311,6 +341,7 @@ void process()
                 xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y;
                 image[feature_id].emplace_back(camera_id,  xyz_uv_velocity);
             }
+            //　step2.4 　处理视觉残差
             estimator.processImage(image, img_msg->header);
 
             double whole_t = t_s.toc();
@@ -328,7 +359,10 @@ void process()
                 pubRelocalization(estimator);
             //ROS_ERROR("end: %f, at %f", img_msg->header.stamp.toSec(), ros::Time::now().toSec());
         }
+
+        //step :  利用后端优化得到ba,bg　进行ＩＭＵ最新状态的预测
         m_estimator.unlock();
+        // 注意上锁和解锁的顺序要对应
         m_buf.lock();
         m_state.lock();
         if (estimator.solver_flag == Estimator::SolverFlag::NON_LINEAR)
